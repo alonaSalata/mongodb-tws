@@ -1,0 +1,292 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------#
+# FILENAME: profiler
+# PURPOSE : gather slowqueries in Collection
+# AUTHOR  : EKG
+# EMAIL   : DBA-APF-Oracle@system.dvag.com
+# ---------------------------------------------------------------------------#
+
+printValue()
+{
+  section="$1"
+  SECTION=${section^^}
+  param="$2"
+  PARAM=${param^^}
+  found=false
+  while read line
+  do
+    LINE=${line^^}
+    [[ $found == false && "$LINE" != "[$SECTION]" ]] &&  continue
+    [[ $found == true && "${LINE:0:1}" = '[' ]] && break
+    found=true
+    [[ "${LINE%=*}" == "${PARAM}" ]] && { echo "${line#*=}"; break; }
+  done
+}
+
+printSection()
+{
+  section="$1"
+  SECTION=${section^^}
+  found=false
+  while read line
+  do
+    LINE=${line^^}
+    [[ $found == false && "$LINE" != "[$SECTION]" ]] &&  continue
+    [[ $found == true && "${LINE:0:1}" = '[' ]] && break
+    found=true
+    echo "$line"
+  done
+}
+
+
+DATUM=$(date +'%Y%m%d_%H%M%S')
+MONGO_DATE=$(date +'%Y%m%d %H%M%S')
+LOGFILE="/tws/log/dba/profiler_${DATUM}.log"
+TMPSTBY="/tws/log/dba/profiler_${DATUM}.lst"
+JSFILE=/tws/log/dba/profiler_${DATUM}.js
+SORTFILE=/tws/log/dba/profiler_${DATUM}.txt
+DOCUMENT_FILE=/tws/log/dba/profiler_${DATUM}.doc
+CONFFILE="/tws/parms/dba/profiler.cfg"
+STATUS="OK"
+
+
+# USAGE
+if [[ ("$1" == "load" ) && ("$2" == "ENT" || "$2" == "ABN" || "$2" == "PRD") ]]; then
+                printf ""
+else
+                echo "============================================="
+                echo "============== USAGE ========================"
+                echo ""
+                echo "./profiler   load|clean  ENT|ABN|PRD"
+                echo ""
+                echo "============================================="
+                exit 0
+fi
+
+
+#Kontrolle ob der Job laeuft..
+for pid in $(/sbin/pidof -x profiler); do
+    if [ $pid != $$ ]; then
+        echo "[$(date)] : Job profiler laeuft..! PID $pid"
+        exit 0
+    fi
+done
+
+MASK1="%-100s %-9s\n"
+MASK2="%-80s%-20s %-9s\n"
+MASK3="%-80s%-10s%10s %-9s\n"
+MASK4="%-90s%10s %-9s\n"
+MASK5="%-40s%10s %-9s\n"
+MASK6="%-110s\n"
+
+echo -n > ${LOGFILE}
+echo -n > ${TMPSTBY}
+
+LINE="--------------------------------------------------------------------------------------------------------"
+echo $LINE | tee -a ${LOGFILE}
+
+function end {
+if [ "${STATUS}" == "OK" ]; then
+        echo ""  | tee -a ${LOGFILE}
+	echo "Profiler **Success**" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE
+        exit 0
+else
+	echo ""  | tee -a ${LOGFILE}
+        echo "Profiler **Failed**" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE | tee -a ${LOGFILE}
+        exit 1
+fi
+}
+
+
+echo | tee -a ${LOGFILE}
+echo "Validating Configuration File ${CONFFILE}..." | tee -a ${LOGFILE}
+if [ ! -s ${CONFFILE} ]; then
+                STATUS="NOK"
+                printf "%-100s %-20s \n" "Configurationfile not found!" "NOK" | tee -a ${LOGFILE}
+                end
+else
+
+	projectname="$2"
+        proxy="$(egrep -iw ^HTTPS_PROXY ${CONFFILE} | awk -F '=' '{print $2}')"
+	api_key="$(egrep -iw ^API_KEY ${CONFFILE} | awk -F '=' '{print $2}')"
+	group_id="$(egrep -iw ^${projectname}_GROUP_ID ${CONFFILE} | awk -F '=' '{print $2}')"
+	mongo_server="$(egrep -iw ^MONGO_SERVER ${CONFFILE} | awk -F '=' '{print $2}')"
+	mongo_user="$(egrep -iw ^MONGO_USER ${CONFFILE} | awk -F '=' '{print $2}')"
+	password_file="$(egrep -iw ^PASSWORD_FILE ${CONFFILE} | awk -F '=' '{print $2}')"
+	namespace=$(date +'%Y%m')
+	collection=$(date +'%d')
+
+
+        declare -a var_names=("proxy" "api_key" "group_id" "projectname" "mongo_server" "mongo_user" "password_file" "namespace" "collection" )
+        declare -a var_values=("$proxy" "$api_key" "$group_id" "$projectname" "$mongo_server" "$mongo_user" "$password_file" "$namespace" "$collection" ) 
+        number_vars=${#var_names[@]}
+        x=0
+
+        while [ $x -lt $number_vars ]; do
+                eval param=\${var_values[x]};
+                if [ -z "$param" ]; then
+                        STATUS="NOK"
+                        echo "ERROR: No entry for ${var_names[x]} in the configfile ${CONFFILE}" | tee -a ${LOGFILE}
+                        end
+                else
+			if [[ ${var_names[x]} == "api_key" || ${var_names[x]} == "group_id"  ]]; then
+				echo "INFO: ${var_names[x]} : ********" | tee -a ${LOGFILE}
+			else
+	                        echo "INFO: ${var_names[x]} : ${var_values[x]}" | tee -a ${LOGFILE}
+			fi
+                fi
+                        ((x++))
+        done
+
+	export https_proxy=${proxy}
+        echo "Validation OK" | tee -a ${LOGFILE}
+fi
+
+
+password="`cat ${password_file}`"
+#echo ${password}
+if [ "$1" == "load" ]; then
+ echo $LINE | tee -a ${LOGFILE}
+ echo "Loading ${2} SlowQueries in Namespace : ${namespace} , Collection : ${collection} ..." | tee -a ${LOGFILE}
+
+ command="curl --user ${api_key} --digest      \
+--include     --silent  \
+--request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/clusters?pretty=true\"|grep \"mongoURIWithOptions\"|grep -v \"restoretest\"
+"
+
+ #echo "${command}"
+
+ clusters=`eval ${command}`
+ if [ "$?" != "0" ]; then
+        STATUS="NOK"
+ fi
+ 
+ clusters=`echo ${clusters}|awk -F"mongodb://" '{print $2}'`
+ clusters=`echo ${clusters}|awk -F"/" '{print $1}'`
+ echo "Clusters : ${clusters} in ${2} Environment"
+
+ echo -n > ${TMPSTBY}
+ IFS=',' read -ra ADDR <<< "${clusters}"
+ for cluster in "${ADDR[@]}"; do
+  
+  command="curl   --user  ${api_key}  --digest  -i  --silent  \
+ --header \"Accept: application/json\"            \
+ --request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/processes/${cluster}/performanceAdvisor/slowQueryLogs?pretty=true\"|egrep -e 'line|namespace'"
+
+  #echo ${command}
+  eval ${command}>> ${TMPSTBY}
+  if [ "$?" != "0" ]; then
+        STATUS="NOK"
+  fi 
+ done 
+ sed -i 's/"{/{/g' ${TMPSTBY}
+ sed -i 's/}"/}/g' ${TMPSTBY}
+ sed -i 's/\\//g'  ${TMPSTBY}
+ #echo ${TMPSTBY}
+
+ document="{ "
+ while read line; do
+	document="${document}""${line}"
+	if [ -n "$(echo ${line}|grep namespace)" ]; then 
+		document="${document},\"insertdate\":\"${MONGO_DATE}\"}"
+		expr_replace=$(echo $document|jq '[.line]')
+		#echo ${expr_replace}
+		echo "${document}">${SORTFILE}
+		#cat ${SORTFILE}
+		jq -r --arg newval "${expr_replace}" '.line|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
+		
+		cat ${DOCUMENT_FILE}>${SORTFILE}
+		sed -i 's/\"\[/\[/g' ${SORTFILE}
+		sed -i 's/\]\"/\]/g' ${SORTFILE}
+		sed -i 's/\\n//g' ${SORTFILE}
+		sed -i 's/\\//g' ${SORTFILE}
+		#cat ${SORTFILE}
+		expr_replace=$(echo $document|jq '[.line.attr]')
+		#echo "${expr_replace}"
+		jq -r --arg newval "${expr_replace}" '.line[].attr|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
+
+                cat ${DOCUMENT_FILE}>${SORTFILE}
+		sed -i 's/\"\[/\[/g' ${SORTFILE}
+                sed -i 's/\]\"/\]/g' ${SORTFILE}
+                sed -i 's/\\n//g' ${SORTFILE}
+                sed -i 's/\\//g' ${SORTFILE}
+                #cat ${SORTFILE}
+		expr_replace=$(echo $document|jq '[.line.attr.command]')
+		#echo "${expr_replace}"
+		jq --arg newval "${expr_replace}" '.line[].attr[].command|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
+
+                cat ${DOCUMENT_FILE}>${SORTFILE}
+		sed -i 's/\"\[/\[/g' ${SORTFILE}
+                sed -i 's/\]\"/\]/g' ${SORTFILE}
+                sed -i 's/\\n//g' ${SORTFILE}
+                sed -i 's/\\//g' ${SORTFILE}
+                #cat ${SORTFILE}
+		expr_replace=$(echo $document|jq '[.line.attr.locks]')
+                jq --arg newval "${expr_replace}" '.line[].attr[].locks|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
+
+                cat ${DOCUMENT_FILE}>${SORTFILE}
+		sed -i 's/\"\[/\[/g' ${SORTFILE}
+                sed -i 's/\]\"/\]/g' ${SORTFILE}
+                sed -i 's/\\n//g' ${SORTFILE}
+                sed -i 's/\\//g' ${SORTFILE}
+                #cat ${SORTFILE}
+		expr_replace=$(echo $document|jq '[.line.attr.writeConcern]')
+                jq --arg newval "${expr_replace}" '.line[].attr[].writeConcern|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
+
+                cat ${DOCUMENT_FILE}>${SORTFILE}
+	
+		#sed -i 's/\"/\\\"/g' ${SORTFILE}	
+		#cat ${SORTFILE}
+
+		#echo ${SORTFILE}
+		
+		cat > ${JSFILE}  << EOF
+use "${namespace}";
+
+db.runCommand(
+		   {
+		      insert: "${collection}",
+		      documents: [
+
+EOF
+		cat ${SORTFILE}>>${JSFILE}
+
+		cat >> ${JSFILE}  << EOF3
+		      ],
+		      ordered: false,
+		      writeConcern: { w: "majority", wtimeout: 5000 }
+		   }
+		);		
+		
+exit;
+EOF3
+
+		#cat ${JSFILE}
+		echo "use ${namespace};" > ${JSFILE}
+		echo ${mongo_server}
+		echo ${mongo_user}
+		echo ${password}
+		cat ${JSFILE}
+		command="mongo ${mongo_server} --username ${mongo_user}  --password ${password}"
+		echo "${command}"
+		eval "${command}"
+		#mongo ${mongo_server} --username ${mongo_user}  --password ${password}  #< ${JSFILE} 
+		echo OK	
+		if [ "$?" != "0" ]; then
+		      STATUS="NOK"
+		fi
+
+		document="{"
+		exit 0
+	fi
+ done < <(egrep -e 'line|namespace' ${TMPSTBY})
+fi
+
+################
+end

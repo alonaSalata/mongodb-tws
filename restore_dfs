@@ -1,0 +1,324 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------#
+# FILENAME: restore_dfs
+# PURPOSE : restore Mongo Backup auf Mongodb Cloud
+# AUTHOR  : EKG
+# EMAIL   : DBA-APF-Oracle@system.dvag.com
+# ---------------------------------------------------------------------------#
+
+DATUM=$(date +'%Y%m%d_%H%M%S')
+LOGFILE="/tws/log/dba/restore_dfs_${DATUM}.log"
+TMPSTBY="/tws/log/dba/restore_dfs_${DATUM}.lst"
+CONFFILE="/tws/parms/dba/restore_dfs.cfg"
+STATUS="OK"
+
+
+# USAGE
+if [[ "$1" == "restore" && ("$2" == "all" || "$2" != "") ]]; then
+                printf ""
+else
+                echo "======================================================================"
+                echo "============================= USAGE =================================="
+                echo ""
+                echo "./restore_dfs restore  [dbnamespace] | [dbnamespace.collection]  | all"
+                echo ""
+                echo "======================================================================"
+                exit 0
+fi
+
+
+#Kontrolle ob der Job laeuft..
+for pid in $(/sbin/pidof -x restore_dfs); do
+    if [ $pid != $$ ]; then
+        echo "[$(date)] : Job restore_dfs laeuft..! PID $pid"
+        exit 0
+    fi
+done
+
+MASK1="%-100s %-9s\n"
+MASK2="%-80s%-20s %-9s\n"
+MASK3="%-80s%-10s%10s %-9s\n"
+MASK4="%-90s%10s %-9s\n"
+MASK5="%-40s%10s %-9s\n"
+MASK6="%-110s\n"
+
+echo -n > ${LOGFILE}
+echo -n > ${TMPSTBY}
+
+LINE="--------------------------------------------------------------------------------------------------------"
+echo $LINE | tee -a ${LOGFILE}
+
+function end {
+if [ "${STATUS}" == "OK" ]; then
+        echo "Restore DFS **Success**" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+	echo "$hostname ${LOGFILE}" | mail -s "Restore DFS **Success**"  DBA-APF-Oracle@system.dvag.com alona.salata@dvag.com
+#	echo "Daten zur VP-Digital wurden erfolgreich aktualisiert"  | mail -s "Restore VP-Digital **Success**" "julius.sickenberger.extern@dvag.com sarah.berges@dvag.com johannes.gerhard@dvag.com alona.salata@dvag.com"
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE
+        exit 0
+else
+        echo "Failed!" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+        echo "$hostname ${LOGFILE}" | mail -s "Restore DFS **Failed**"  DBA-APF-Oracle@system.dvag.com alona.salata@dvag.com
+#       echo "Fehler bei der Aktualisierung der Daten zur VP-Digital. DBAs analysieren und beheben die Fehlr zeitnah." | mail -s "Restore DFS **Failed**" "julius.sickenberger.extern@dvag.com;sarah.berges@dvag.com;johannes.gerhard@dvag.com"
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE | tee -a ${LOGFILE}
+        exit 0
+fi
+}
+
+echo | tee -a ${LOGFILE}
+echo "1. Validating Configuration File ${CONFFILE}..." | tee -a ${LOGFILE}
+if [ ! -s ${CONFFILE} ]; then
+                STATUS="NOK"
+                printf "%-100s %-20s \n" "Configurationfile not found!" "NOK" | tee -a ${LOGFILE}
+                end
+else
+        proxy="$(egrep -iw ^HTTPS_PROXY ${CONFFILE} | awk -F '=' '{print $2}')"
+        sas_url="$(egrep -iw ^SAS_URL ${CONFFILE})"
+	sas_url=`echo "$sas_url"|sed  's/SAS_URL=//g'|sed 's/"//g'`
+	endpoint="$(egrep -iw ^ENDPOINT ${CONFFILE} | awk -F '=' '{print $2}'|sed 's/"//g')"
+	download_dir="$(egrep -iw ^DOWNLOAD_DIR ${CONFFILE} | awk -F '=' '{print $2}')"
+	azcopy_home="$(egrep -iw ^AZCOPY_HOME ${CONFFILE} | awk -F '=' '{print $2}')"
+	mongo_server="$(egrep -iw ^MONGO_SERVER ${CONFFILE} | awk -F '=' '{print $2}')"
+	mongo_user="$(egrep -iw ^MONGO_USER ${CONFFILE} | awk -F '=' '{print $2}')"
+	password_file="$(egrep -iw ^PASSWORD_FILE ${CONFFILE} | awk -F '=' '{print $2}')"	
+	api_key="$(egrep -iw ^API_KEY ${CONFFILE} | awk -F '=' '{print $2}')"
+	group_id="$(egrep -iw ^GROUP_ID ${CONFFILE} | awk -F '=' '{print $2}')"
+	control_user="$(egrep -iw ^CONTROL_USER ${CONFFILE} | awk -F '=' '{print $2}')"
+	control_dbnamespaces="$(egrep -iw ^CONTROL_DBNAMESPACES ${CONFFILE} | awk -F '=' '{print $2}')"
+
+        declare -a var_names=("proxy" "sas_url" "endpoint" "download_dir" "azcopy_home" "mongo_server" "mongo_user" "password_file" "api_key" "group_id" "control_user" "control_dbnamespaces")
+        declare -a var_values=("$proxy" "$sas_url" "$endpoint" "$download_dir" "$azcopy_home" "$mongo_server" "$mongo_user" "$password_file" "$api_key" "$group_id" "$control_user" "$control_dbnamespaces") 
+        number_vars=${#var_names[@]}
+        x=0
+
+        while [ $x -lt $number_vars ]; do
+                eval param=\${var_values[x]};
+                if [ -z "$param" ]; then
+                        STATUS="NOK"
+                        echo "ERROR: No entry for ${var_names[x]} in the configfile ${CONFFILE}" | tee -a ${LOGFILE}
+                        end
+                else
+			if [[ ${var_names[x]} == "sas_url" || ${var_names[x]} == "api_key" || ${var_names[x]} == "group_id"  ]]; then
+				echo "INFO: ${var_names[x]} : ********" | tee -a ${LOGFILE}
+			else
+	                        echo "INFO: ${var_names[x]} : ${var_values[x]}" | tee -a ${LOGFILE}
+			fi
+                fi
+                        ((x++))
+        done
+
+	export https_proxy=${proxy}
+        echo "Validation OK" | tee -a ${LOGFILE}
+fi
+
+#LISTING BACKUP FILE FROM AZURE TENANT
+echo $LINE | tee -a ${LOGFILE}
+echo "2. Listing last Backup File ..." | tee -a ${LOGFILE}
+
+command_proxy="export https_proxy="${proxy}""
+azcopy_file="${azcopy_home}/azcopy"
+command_azure="${azcopy_file} ls  \"${endpoint}${sas_url}\"|sort -r|head -1"
+
+#echo "${command_proxy}"
+#echo "${command_azure}"
+
+eval "${command_proxy}";
+FILE=`eval "${command_azure}"|awk -F"INFO: " '{print $2}'|awk -F";" '{print $1}'`;
+if [ "$?" != "0" ]; then
+	echo "Listing File failed..."| tee -a ${LOGFILE}
+	echo "${command_proxy}"
+        echo "${command_azure}"
+	exit 1
+fi
+echo FILE="$FILE"
+
+
+#DOWNLOADING FILE
+echo $LINE | tee -a ${LOGFILE}
+echo "3. Downloading last Backup File ..." | tee -a ${LOGFILE}
+
+
+#if [ ! -f ${download_dir}${FILE} ]; then
+
+  command_azure="${azcopy_file} copy  \"${endpoint}/${FILE}${sas_url}\" "$download_dir""
+
+  eval "${command_azure}"  | tee -a ${LOGFILE}
+  if [ "$?" != "0" ]; then
+        echo "Downloading File failed..."| tee -a ${LOGFILE}
+        echo "${command_proxy}"
+        echo "${command_azure}"
+        exit 1
+  else
+	echo "Downloading successfully ended..." | tee -a ${LOGFILE}
+  fi
+#else
+#	echo "the File : ${FILE} already exists..."| tee -a ${LOGFILE}
+#fi
+
+
+#UNTAR FILE
+echo $LINE | tee -a ${LOGFILE}
+echo "4. Extracting last Backup File ..." | tee -a ${LOGFILE}
+
+cd ${download_dir};
+if [ "$?" != "0" ]; then
+        echo "Directory does not exists..."| tee -a ${LOGFILE}
+        exit 1
+fi
+
+rm -rf dump;
+if [ "$?" != "0" ]; then
+        echo "Error removing old Backup Directory..."| tee -a ${LOGFILE}
+        exit 1
+fi
+
+command="tar -xf ${FILE} --exclude=\"backup/admin\""
+eval "${command}" | tee -a ${LOGFILE}
+if [ "$?" != "0" ]; then
+        echo "Error extracting Tar File : ${FILE}..."| tee -a ${LOGFILE}
+        exit 1
+else
+	echo "Extracting successfully ended..."| tee -a ${LOGFILE}
+fi
+
+mv backup dump
+
+
+#RESTORING MONGO DB NAMESPACES
+echo $LINE | tee -a ${LOGFILE}
+echo "5. Restoring DB-Namespaces ..." | tee -a ${LOGFILE}
+password="`cat ${password_file}`"
+#echo ${password}
+cd ${download_dir}
+if [ "$2" == "all" ]; then
+ for dir in dump/*; do
+  echo "Directory : $dir , restoring..."| tee -a ${LOGFILE}
+  dbname=$(echo ${dir##*/})
+  command="mongorestore --uri "${mongo_server}" --username "${mongo_user}" dump/ --nsInclude="$dbname.*" --password "${password}" --drop"
+
+  #echo "${command}"
+
+  eval "${command}"|tee -a ${LOGFILE}
+  if [ "$?" != "0" ]; then
+        echo "Error Restoring $dir ..."| tee -a ${LOGFILE}
+	echo COMMAND="${command}" | tee -a ${LOGFILE}
+        exit 1
+  else
+	echo "-->DB-Namespace: $dbname , restored Successfully.!"| tee -a ${LOGFILE}
+  fi
+ done
+else
+  dbname=$2
+  echo "DB-Namespace: $dbname , restoring..."| tee -a ${LOGFILE}
+  if [ "`echo $dbname|grep  "\."|wc -l`" != "0" ]; then
+	command="mongorestore --uri "${mongo_server}" --username "${mongo_user}" dump/ --nsInclude="$dbname" --password "${password}" --drop"
+  else
+	command="mongorestore --uri "${mongo_server}" --username "${mongo_user}" dump/ --nsInclude="$dbname.*" --password "${password}" --drop"
+  fi
+  #echo "${command}"
+
+  eval "${command}"|tee -a ${LOGFILE}
+  if [ "$?" != "0" ]; then
+        echo "Error Restoring $dir ..."| tee -a ${LOGFILE}
+        echo COMMAND="${command}"| tee -a ${LOGFILE}
+        exit 1
+  else
+	echo "-->DB-Namespace: $dbname , restored Successfully.!"| tee -a ${LOGFILE}
+  fi 	
+fi
+
+
+#LAST KNOWN STATE CHECK
+echo $LINE | tee -a ${LOGFILE}
+echo "6. Checking Last Known State ..." | tee -a ${LOGFILE}
+
+#CLOUD CONTROL USER NAMESPACES
+command="curl --user ${api_key} --digest      --header \"Accept: application/json\"      --header \"Content-Type: application/json\"      --include      --request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/databaseUsers/admin/${control_user}?pretty=true\" --silent|egrep -e 'databaseName'|grep -v admin|awk -F\"    \\\"databaseName\\\" : \" '{print \$2}'|sed  's/\"//g'|sed 's/,//g'|sort -n"
+
+#echo "${command}"
+
+eval ${command} > ${TMPSTBY}
+
+#cat ${TMPSTBY}
+
+control_cloud_dbnamespaces=""
+
+while read line; do
+        control_cloud_dbnamespaces="${control_cloud_dbnamespaces}${line},"
+done < ${TMPSTBY}
+
+#echo $control_cloud_dbnamespaces
+
+if [ "$2" == "all" ]; then
+
+ #DOWNLOAD DIR CONTROL
+ cd ${download_dir}/dump
+ dir_all=""
+ for dir in *; do
+	dir_all="${dir_all}${dir},"
+ done
+
+ #echo $dir_all
+
+else
+ dbname=$2
+ if [ "`echo $dbname|grep  "\."|wc -l`" != "0" ]; then
+	dir_all=`echo $2|awk -F"." '{print $1}'`,
+ else
+	dir_all=$2,
+ fi
+fi
+
+#echo $dir_all
+
+#NEW dbs
+IFS=',' read -ra ADDR <<< "$dir_all"
+for i in "${ADDR[@]}"; do
+  control=`echo "${control_dbnamespaces}"|grep -i $i|wc -l`
+  if [ "$control" == "0" ]; then
+        echo "new Db : ${i}" | tee -a ${LOGFILE}
+	control_cloud=`echo "${control_cloud_dbnamespaces}"|grep -i $i|wc -l`
+	if [ "$control_cloud" == "0" ]; then
+		echo "-->has **NO** Priviliges for ${control_user}" | tee -a ${LOGFILE}
+	else
+		echo "-->has Priviliges for ${control_user}" | tee -a ${LOGFILE}
+	fi
+  fi
+done
+
+
+if [ "$2" == "all" ]; then
+ #PARAMETER FILE LAST KNOWN STATE
+ #not more exists
+ IFS=',' read -ra ADDR <<< "$control_dbnamespaces"
+ for i in "${ADDR[@]}"; do
+  control=`echo "${dir_all}"|grep -i $i|wc -l`
+  if [ "$control" == "0" ]; then
+        echo "Db not more exists : ${i}" | tee -a ${LOGFILE}
+	control_cloud=`echo "${control_cloud_dbnamespaces}"|grep -i $i|wc -l`
+	if [ "$control_cloud" == "0" ]; then
+		echo "-->has **NO** Priviliges for ${control_user}" | tee -a ${LOGFILE}
+	else
+		echo "-->has Priviliges for ${control_user}" | tee -a ${LOGFILE}
+	fi
+  fi
+ done
+fi
+
+#REPLACE LAST_KNOWN_STATE
+if [ "$2" == "all" ]; then
+	sed -i "s/CONTROL_DBNAMESPACES=${control_dbnamespaces}/CONTROL_DBNAMESPACES=${dir_all}/g"  ${CONFFILE}
+else
+	control=`echo "${control_dbnamespaces}"|grep -i ${dir_all}|wc -l`
+        if [ "$control" == "0" ]; then
+		sed -i "s/CONTROL_DBNAMESPACES=${control_dbnamespaces}/CONTROL_DBNAMESPACES=${control_dbnamespaces}${dir_all}/g"  ${CONFFILE}
+	fi
+fi
+
+
+################
+end
+

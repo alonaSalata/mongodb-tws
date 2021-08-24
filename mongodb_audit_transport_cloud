@@ -1,0 +1,256 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------#
+# FILENAME: mongodb_audit_transport_cloud
+# PURPOSE : holt die audit logs von mongodb cloud
+# AUTHOR  : ASA
+# EMAIL   : DBA-APF-Oracle@system.dvag.com
+# ---------------------------------------------------------------------------#
+#1 0 * * * /tws/jobs/dba/backup_fs_db_cron >>/tws/log/dba/backup_fs_db_cron_$(date +'\%Y\%m\%d_\%H\%M\%S').cron.log 2>&1
+
+DATUM=$(date +'%Y%m%d_%H%M%S')
+end_timestamp=""
+start_timestamp=""
+if compgen -G "/tws/log/dba/mongodb_audit_transport_cloud_*.log" > /dev/null ; then
+        last_log="$(ls -t /tws/log/dba/mongodb_audit_transport_cloud_*.log | head -1)"
+        start_timestamp="$(echo ${last_log} | awk -F '_cloud_' '{print $2}' | awk -F '_' '{print $1}')"
+        end_timestamp="$(date -d "$( date -d "0 days ago" -u | sed 's/..:..:../00:00:00/')" +%s)"
+else
+        start_timestamp="$(date -d "$( date -d "1 days ago" -u | sed 's/..:..:../00:00:00/')" +%s)"
+        end_timestamp="$(date -d "$( date -d "0 days ago" -u | sed 's/..:..:../00:00:00/')" +%s)"
+fi
+
+echo "start_timestamp is $start_timestamp"
+echo "end_timestamp is $end_timestamp"
+
+#test timestamps
+#start_timestamp="1618099200"
+#end_timestamp="1618250400"
+
+LOGFILE="/tws/log/dba/mongodb_audit_transport_cloud_${end_timestamp}_${DATUM}.log"
+CONFFILE="/tws/parms/dba/mongodb_audit_transport_cloud.cfg"
+STATUS="OK"
+
+
+LINE="--------------------------------------------------------------------------------------------------------"
+echo $LINE | tee -a ${LOGFILE}
+echo "Copying MongoDB Cloud Audit Files to Azure start_timestamp $start_timestamp ($(date -d @${start_timestamp} -u)) to end_timestamp $end_timestamp ($(date -d @${end_timestamp} -u))... " | tee -a ${LOGFILE}
+echo $LINE | tee -a ${LOGFILE}
+
+function end {
+if [ "${STATUS}" == "OK" ]; then
+        echo "Success!" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE
+        exit 0
+else
+        echo "Failed!" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+#       echo "MongoDB Auditlogs to Azure" | mail -s "ERROR: Skript Failed with $(egrep -iw "^ERROR:" ${LOGFILE})" DBA-APF-Oracle@system.dvag.com
+        echo "ERROR: Skript Failed with $(egrep -iw "^ERROR:" ${LOGFILE})" | mail -s "MongoDB Auditlogs to Azure" alona.salata@dvag.com
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE | tee -a ${LOGFILE}
+        exit 0
+fi
+}
+
+echo | tee -a ${LOGFILE}
+
+function validate {
+echo "1. Validating Configuration File ${CONFFILE}..." | tee -a ${LOGFILE}
+if [ ! -s ${CONFFILE} ]; then
+                STATUS="NOK"
+                printf "%-100s %-20s \n" "Configurationfile not found!" "NOK" | tee -a ${LOGFILE}
+                end
+else
+        proxy="$(egrep -iw ^HTTPS_PROXY ${CONFFILE} | awk -F '=' '{print $2}')"
+        azcopyhome="$(egrep -iw ^AZCOPY_HOME ${CONFFILE} | awk -F '=' '{print $2}')"
+        user="$(egrep -iw ^API_KEY ${CONFFILE} | awk -F '=' '{print $2}')"
+        nodes="$(egrep ^ENABLED  ${CONFFILE})"
+
+        declare -a var_names=("proxy" "azcopyhome" "user" "nodes")
+        declare -a var_values=("$proxy" "$azcopyhome" "$user" "$nodes")
+        number_vars=${#var_names[@]}
+        x=0
+
+        while [ $x -lt $number_vars ]; do
+                eval param=\${var_values[x]};
+                if [ -z "$param" ]; then
+                        STATUS="NOK"
+                        echo "ERROR: No entry for ${var_names[x]} in the configfile ${CONFFILE}" | tee -a ${LOGFILE}
+                        end
+                else
+                        echo "INFO: ${var_names[x]} : ${var_values[x]}" | tee -a ${LOGFILE}
+                fi
+                        ((x++))
+        done
+
+        export HTTPS_PROXY=${proxy}
+        echo "Validation OK" | tee -a ${LOGFILE}
+fi
+}
+#########################
+# CLEANUP OLD AUDITLOGS
+#########################
+function cleanup {
+echo "2. Cleanup old audit logs ..." | tee -a ${LOGFILE}
+umgebungen="$(egrep ^SAS_URL_ ${CONFFILE} | awk -F '_' '{print $3}'| awk -F '=' '{print $1}')"
+for x in $umgebungen; do
+	echo $x
+        diff_list="/tws/work/dba/mongodb_audit_logs_azure_${x}"
+        echo > $diff_list
+        sas="$(egrep -iw SAS_URL_${x} ${CONFFILE} | awk -F "SAS_URL_${x}=" '{print $2}')"
+	echo $sas
+        download=$(egrep -iw DOWNLOAD_DIR_${x} ${CONFFILE} | awk -F "DOWNLOAD_DIR_${x}=" '{print $2}')
+	echo $download
+		export HTTPS_PROXY="http://proxy.infra.dvag.net:3128"
+		export HTTP_ROXY="http://proxy.infra.dvag.net:3128"
+		echo "${azcopyhome}/azcopy list ${sas} >> ${diff_list}"
+		command="${azcopyhome}/azcopy list ${sas} >> ${diff_list}"
+		eval ${command} | tee -a ${LOGFILE}
+                RC="$?"
+                if [ "${RC}" != "0" ]; then
+                        STATUS="NOK"
+                        echo "ERROR: RC is "${RC}" - failed to ${azcopyhome}/azcopy list ${sas}" | tee -a ${LOGFILE}
+                else
+                        if [ -z "$(ls ${download})" ]; then
+                                echo "INFO: ${download} is empty, nothing to cleanup" | tee -a ${LOGFILE}
+                        else
+                        	for file in $(ls ${download}); do
+                                file_azure="$(grep -iw $file $diff_list | awk -F 'INFO: ' '{print $2}' | awk -F ';' '{print $1}')"
+                                if [ ! -z "$file_azure" ]; then
+					echo "INFO: removing obsolete logfile from local ${download}..." | tee -a ${LOGFILE}
+					command="rm -f ${download}/$file"
+					eval ${command} | tee -a ${LOGFILE}
+                                        RC="$?"
+                                                if [ "${RC}" != "0" ]; then
+                                                        STATUS="NOK"
+                                                        echo "ERROR: RC is "${RC}" - failed to rm -f ${download}/$file" | tee -a ${LOGFILE}
+                                                else
+                                                        echo "INFO: RC is "${RC}" - successfully removed ${download}/$file" | tee -a ${LOGFILE}
+                                                fi
+                                fi
+	                        done
+                        fi
+
+                fi
+done
+}
+##############################################
+# DOWNLOAD AUDITLOGS FROM CLOUD
+#############################################
+
+function download {
+echo | tee -a ${LOGFILE}
+echo "3. Download audit logs from mongoDB cloud..." | tee -a ${LOGFILE}
+export HTTPS_PROXY=${proxy}
+export HTTP_PROXY=${proxy}
+        for line in $nodes; do
+                [[ "$line" =~ ^"#" || -z "$line" ]] && continue
+                umg="$(echo "$line" | awk -F ":" '{print $2}')"
+                node="$(echo "$line" | awk -F ":" '{print $3}')"
+                sas="$(egrep -iw SAS_URL_${umg} ${CONFFILE} | awk -F "SAS_URL_${umg}=" '{print $2}')"
+                download=$(egrep -iw DOWNLOAD_DIR_${umg} ${CONFFILE} | awk -F "DOWNLOAD_DIR_${umg}=" '{print $2}')
+                id="$(egrep -iw ID_${umg} ${CONFFILE} | awk -F "ID_${umg}=" '{print $2}')"
+
+                declare -a var_names=("umg" "node" "sas" "download" "id")
+                declare -a var_values=("$umg" "$node" "$sas" "$download" "$id")
+                number_vars=${#var_names[@]}
+                y=0
+                while [ $y -lt $number_vars ]; do
+                        eval param=\${var_values[y]};
+                        if [ -z "$param" ]; then
+                                STATUS="NOK"
+                                echo "ERROR: No entry for ${var_names[y]} in the configfile ${CONFFILE}" | tee -a ${LOGFILE}
+                                end
+                        else
+                                echo "INFO: ${var_names[y]} is ${var_values[y]}" | tee -a ${LOGFILE}
+                        fi
+                        ((y++))
+                done
+                echo "Processing audit log for $node" | tee -a ${LOGFILE}
+                filename="mongodb-auditlog_${node}_${start_timestamp}_${end_timestamp}.gz"
+                if [[ ! -d ${download} ]]; then
+			command="mkdir -p ${download}"
+			eval ${command} | tee -a ${LOGFILE}
+                        RC="$?"
+                        if [ "${RC}" != "0" ]; then
+                                STATUS="NOK"
+                                echo "ERROR: RC is "${RC}" - failed to mkdir -p ${download}" | tee -a ${LOGFILE}
+                                end
+                        else
+                                echo "INFO: RC is "${RC}" - successfully created download directory ${download}" | tee -a ${LOGFILE}
+                        fi
+                fi
+		command="curl --user $user \
+ --digest  --header 'Accept:application/gzip' \
+--request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${id}/clusters/${node}/logs/mongodb-audit-log.gz?startDate=${start_timestamp}&endDate=${end_timestamp}\"
+--output ${download}/${filename} 2>>${LOGFILE}"
+		echo "${command}"
+		eval ${command} | tee -a ${LOGFILE}		
+                # CHECK .gz type and errors
+	                if [ ! -e "${download}/${filename}" ];then
+        	                echo "INFO: Auditlog for ${node} startDate=${start_timestamp} endDate=${end_timestamp} is empty" | tee -a ${LOGFILE}
+                	        touch "${download}/${filename}_empty"
+                        	filename="${filename}_empty"
+	                        touch "${download}/${filename}"
+        	                RC="$?"
+                	        if [ "${RC}" != "0" ]; then
+                        	        STATUS="NOK"
+	                               	echo "ERROR: RC is "${RC}" - failed to touch ${download}/${filename}" | tee -a ${LOGFILE}
+        	                else
+                	                echo "INFO: RC is "${RC}" - successfully created ${download}/${filename}" | tee -a ${LOGFILE}
+                        	fi
+	                else
+        	                output_type="$(file ${download}/${filename} | awk -F ": " '{print $2}')"
+                	        if [ "$output_type" != "gzip compressed data" ];then
+                        	        STATUS="NOK"
+                                	echo "ERROR: $(cat ${download}/${filename})" | tee -a ${LOGFILE}
+	                        else
+        	                        echo "INFO: Successfully downloaded Auditlog for ${node} startDate=${start_timestamp} endDate=${end_timestamp}" | tee -a ${LOGFILE}
+                	        fi
+	                fi
+done
+}
+
+
+function upload {
+#############################
+# UPLOAD AUDITLOGS TO AZRE
+#############################
+echo | tee -a ${LOGFILE}
+echo "4. Upload audit logs to Azure..." | tee -a ${LOGFILE}
+export HTTPS_PROXY="http://proxy.infra.dvag.net:3128"
+export HTTP_ROXY="http://proxy.infra.dvag.net:3128"
+umgebungen="$(egrep ^SAS_URL_ ${CONFFILE} | awk -F '_' '{print $3}'| awk -F '=' '{print $1}')"
+for x in $umgebungen; do
+	        echo $x
+		sas="$(egrep -iw SAS_URL_${x} ${CONFFILE} | awk -F "SAS_URL_${x}=" '{print $2}')"
+	        echo $sas
+        	download=$(egrep -iw DOWNLOAD_DIR_${x} ${CONFFILE} | awk -F "DOWNLOAD_DIR_${x}=" '{print $2}')
+	        echo $download
+
+        	for file in $(ls ${download}); do
+		echo $file
+                command="${azcopyhome}/azcopy copy ${download}/${file} ${sas}"
+		echo $command
+		eval ${command} | tee -a ${LOGFILE}
+                RC="$?"
+                if [ "${RC}" != "0" ]; then
+                        STATUS="NOK"
+                        echo "ERROR: RC is "${RC}" - failed to ${azcopyhome}/azcopy copy ${download}/${file} ${sas}" | tee -a ${LOGFILE}
+                else
+                        echo "INFO: RC is "${RC}" - upload ${file} to Azure Cloud" | tee -a ${LOGFILE}
+
+                fi
+        	done
+		echo  | tee -a ${LOGFILE}
+done
+}
+################
+validate
+cleanup
+download
+upload
+end
+

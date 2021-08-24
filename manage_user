@@ -1,0 +1,224 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------#
+# FILENAME: manage_user
+# PURPOSE : manage user on mongodb cloud
+# AUTHOR  : EKG
+# EMAIL   : DBA-APF-Oracle@system.dvag.com
+# ---------------------------------------------------------------------------#
+
+printValue()
+{
+  section="$1"
+  SECTION=${section^^}
+  param="$2"
+  PARAM=${param^^}
+  found=false
+  while read line
+  do
+    LINE=${line^^}
+    [[ $found == false && "$LINE" != "[$SECTION]" ]] &&  continue
+    [[ $found == true && "${LINE:0:1}" = '[' ]] && break
+    found=true
+    [[ "${LINE%=*}" == "${PARAM}" ]] && { echo "${line#*=}"; break; }
+  done
+}
+
+printSection()
+{
+  section="$1"
+  SECTION=${section^^}
+  found=false
+  while read line
+  do
+    LINE=${line^^}
+    [[ $found == false && "$LINE" != "[$SECTION]" ]] &&  continue
+    [[ $found == true && "${LINE:0:1}" = '[' ]] && break
+    found=true
+    echo "$line"
+  done
+}
+
+
+DATUM=$(date +'%Y%m%d_%H%M%S')
+LOGFILE="/tws/log/dba/manage_user_${DATUM}.log"
+TMPSTBY="/tws/log/dba/manage_user_${DATUM}.lst"
+CONFFILE="/tws/parms/dba/manage_user.cfg"
+STATUS="OK"
+
+
+# USAGE
+if [[ ("$1" == "create" || "$1" == "delete") && "$2" != ""  ]]; then
+                printf ""
+else
+                echo "======================================="
+                echo "============== USAGE =================="
+                echo ""
+                echo "./manage_user   create|delete  username"
+                echo ""
+                echo "======================================="
+                exit 0
+fi
+
+
+#Kontrolle ob der Job laeuft..
+for pid in $(/sbin/pidof -x create_user); do
+    if [ $pid != $$ ]; then
+        echo "[$(date)] : Job audit_filter laeuft..! PID $pid"
+        exit 0
+    fi
+done
+
+MASK1="%-100s %-9s\n"
+MASK2="%-80s%-20s %-9s\n"
+MASK3="%-80s%-10s%10s %-9s\n"
+MASK4="%-90s%10s %-9s\n"
+MASK5="%-40s%10s %-9s\n"
+MASK6="%-110s\n"
+
+echo -n > ${LOGFILE}
+echo -n > ${TMPSTBY}
+
+LINE="--------------------------------------------------------------------------------------------------------"
+echo $LINE | tee -a ${LOGFILE}
+
+function end {
+if [ "${STATUS}" == "OK" ]; then
+        echo ""  | tee -a ${LOGFILE}
+	echo "CREATE_USER **Success**" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE
+        exit 0
+else
+	echo ""  | tee -a ${LOGFILE}
+        echo "CREATE_USER **Failed**" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE | tee -a ${LOGFILE}
+        exit 0
+fi
+}
+
+
+section=$(printSection "user-"${2} < ${CONFFILE})
+if [ -z "${section}" ]; then
+   echo "User Section $2 not exists in Config File...."|tee -a ${LOGFILE}
+   exit 1
+fi
+
+
+echo | tee -a ${LOGFILE}
+echo "Validating Configuration File ${CONFFILE}..." | tee -a ${LOGFILE}
+if [ ! -s ${CONFFILE} ]; then
+                STATUS="NOK"
+                printf "%-100s %-20s \n" "Configurationfile not found!" "NOK" | tee -a ${LOGFILE}
+                end
+else
+
+	projectname=$(printValue "user-$2" Projectname < ${CONFFILE})
+	cluster=$(printValue "user-$2" Cluster < ${CONFFILE})
+	dbnamespaces_rollen=$(printValue "user-$2" DBNamespacesRollen < ${CONFFILE})
+	user=${2}
+	password=$(printValue "user-$2" Password < ${CONFFILE})
+        proxy="$(egrep -iw ^HTTPS_PROXY ${CONFFILE} | awk -F '=' '{print $2}')"
+	api_key="$(egrep -iw ^API_KEY ${CONFFILE} | awk -F '=' '{print $2}')"
+	group_id="$(egrep -iw ^${projectname}_GROUP_ID ${CONFFILE} | awk -F '=' '{print $2}')"
+
+        declare -a var_names=("proxy" "api_key" "group_id" "projectname" "cluster" "dbnamespace_rollen" "user" "password")
+        declare -a var_values=("$proxy" "$api_key" "$group_id" "$projectname" "$cluster" "$dbnamespaces_rollen" "$user" "$password") 
+        number_vars=${#var_names[@]}
+        x=0
+
+        while [ $x -lt $number_vars ]; do
+                eval param=\${var_values[x]};
+                if [ -z "$param" ]; then
+                        STATUS="NOK"
+                        echo "ERROR: No entry for ${var_names[x]} in the configfile ${CONFFILE}" | tee -a ${LOGFILE}
+                        end
+                else
+			if [[ ${var_names[x]} == "api_key" || ${var_names[x]} == "group_id" || ${var_names[x]} == "password" ]]; then
+				echo "INFO: ${var_names[x]} : ********" | tee -a ${LOGFILE}
+			else
+	                        echo "INFO: ${var_names[x]} : ${var_values[x]}" | tee -a ${LOGFILE}
+			fi
+                fi
+                        ((x++))
+        done
+
+	export https_proxy=${proxy}
+        echo "Validation OK" | tee -a ${LOGFILE}
+fi
+
+if [ "$1" == "create" ]; then
+ echo $LINE | tee -a ${LOGFILE}
+ echo "creating ${1} user ..." | tee -a ${LOGFILE}
+
+ data1="{
+         \"databaseName\": \"admin\",
+         \"password\": \"${password}\",
+         \"roles\": ["
+
+
+ data2=""
+ j=1
+ IFS=',' read -ra ADDR <<< "${dbnamespaces_rollen}"
+ for i in "${ADDR[@]}"; do
+ 	dbnamespace=`echo ${i}|awk -F":" '{print $1}'`
+	rolle=`echo ${i}|awk -F":" '{print $2}'`
+	if [ "$j" -gt "1" ]; then
+		data2="${data2}"","
+	fi
+	data2="${data2}""{
+           \"databaseName\": \"${dbnamespace}\",
+           \"roleName\": \"${rolle}\"
+           }" 
+	j=$((j+1))
+ done
+ 
+ data3="],
+         \"scopes\": [{
+           \"name\": \"${cluster}\", 
+           \"type\": \"CLUSTER\"
+         }],
+         \"username\": \"${user}\"
+       }"
+
+ data="${data1}${data2}${data3}"
+ command="curl --user ${api_key} --digest      \
+--header \"Accept: application/json\"      \
+--header \"Content-Type: application/json\"  \
+--include     --silent  \
+--request POST \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/databaseUsers?pretty=true\" 
+--data '${data}'
+"
+
+ #echo "${command}"
+
+ eval ${command}| tee -a ${LOGFILE}
+ if [ "$?" != "0" ]; then
+        STATUS="NOK"
+ fi
+fi
+
+if [ "$1" == "delete" ]; then
+
+ echo $LINE | tee -a ${LOGFILE}
+ echo "deleting ${1} user ..." | tee -a ${LOGFILE}
+
+
+ command="curl --user ${api_key} --digest      \
+--include  --silent   \
+--request DELETE  \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/databaseUsers/admin/${2}?pretty=true\"
+"
+
+ #echo "${command}"
+
+ eval ${command}| tee -a ${LOGFILE}
+ if [ "$?" != "0" ]; then
+        STATUS="NOK"
+ fi
+
+fi
+################
+end
+
