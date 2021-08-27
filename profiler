@@ -6,6 +6,7 @@
 # EMAIL   : DBA-APF-Oracle@system.dvag.com
 # ---------------------------------------------------------------------------#
 
+
 printValue()
 {
   section="$1"
@@ -57,7 +58,7 @@ else
                 echo "============================================="
                 echo "============== USAGE ========================"
                 echo ""
-                echo "./profiler   load|clean  ENT|ABN|PRD"
+                echo "./profiler   load  ENT|ABN|PRD"
                 echo ""
                 echo "============================================="
                 exit 0
@@ -65,12 +66,12 @@ fi
 
 
 #Kontrolle ob der Job laeuft..
-for pid in $(/sbin/pidof -x profiler); do
-    if [ $pid != $$ ]; then
-        echo "[$(date)] : Job profiler laeuft..! PID $pid"
+pid_count=`pgrep -a "profiler"|grep "$2"|awk '{print $1}'|wc -l`
+#echo "${pid_count}"
+if [ "${pid_count}" -gt "2" ]; then
+        echo "[$(date)] : Job profiler gerade laeuft..!"
         exit 0
-    fi
-done
+fi
 
 MASK1="%-100s %-9s\n"
 MASK2="%-80s%-20s %-9s\n"
@@ -96,6 +97,7 @@ if [ "${STATUS}" == "OK" ]; then
 else
 	echo ""  | tee -a ${LOGFILE}
         echo "Profiler **Failed**" | tee -a ${LOGFILE}
+	cat ${LOGFILE}  | mail -s "Profiler **Failed**"  DBA-APF-Oracle@dvag.com,alona.salata@dvag.com
         # Mailversand mit RC
         echo "Logfile: ${LOGFILE}"
         echo $LINE | tee -a ${LOGFILE}
@@ -116,15 +118,18 @@ else
         proxy="$(egrep -iw ^HTTPS_PROXY ${CONFFILE} | awk -F '=' '{print $2}')"
 	api_key="$(egrep -iw ^API_KEY ${CONFFILE} | awk -F '=' '{print $2}')"
 	group_id="$(egrep -iw ^${projectname}_GROUP_ID ${CONFFILE} | awk -F '=' '{print $2}')"
-	mongo_server="$(egrep -iw ^MONGO_SERVER ${CONFFILE} | awk -F '=' '{print $2}')"
-	mongo_user="$(egrep -iw ^MONGO_USER ${CONFFILE} | awk -F '=' '{print $2}')"
-	password_file="$(egrep -iw ^PASSWORD_FILE ${CONFFILE} | awk -F '=' '{print $2}')"
+	mongo_server=$(egrep -iw ^MONGO_SERVER ${CONFFILE} | awk -F '=' '{print $2}')
+	mongo_user=$(egrep -iw ^MONGO_USER ${CONFFILE} | awk -F '=' '{print $2}')
+	projectname_lower=${projectname,,}
+	password_file=$(egrep -iw ^PASSWORD_FILE ${CONFFILE} | awk -F '=' '{print $2}'|sed "s/##projectname##/${projectname_lower}/g")
+	#echo $password_file
+	last_upload_time=$(egrep -iw ^${projectname}_LAST_UPLOAD_TIME ${CONFFILE} | awk -F '=' '{print $2}'|sed "s/'//g")
 	namespace=$(date +'%Y%m')
 	collection=$(date +'%d')
 
 
-        declare -a var_names=("proxy" "api_key" "group_id" "projectname" "mongo_server" "mongo_user" "password_file" "namespace" "collection" )
-        declare -a var_values=("$proxy" "$api_key" "$group_id" "$projectname" "$mongo_server" "$mongo_user" "$password_file" "$namespace" "$collection" ) 
+        declare -a var_names=("proxy" "api_key" "group_id" "projectname" "mongo_server" "mongo_user" "password_file" "last_upload_time" "namespace" "collection" )
+        declare -a var_values=("$proxy" "$api_key" "$group_id" "$projectname" "$mongo_server" "$mongo_user" "$password_file" "$last_upload_time" "$namespace" "$collection" ) 
         number_vars=${#var_names[@]}
         x=0
 
@@ -149,7 +154,11 @@ else
 fi
 
 
-password="`cat ${password_file}`"
+password=`cat ${password_file}`
+last_upload_milliseconds=$(date -d "${last_upload_time}" +%s%3N)
+
+#echo $last_upload_milliseconds
+
 #echo ${password}
 if [ "$1" == "load" ]; then
  echo $LINE | tee -a ${LOGFILE}
@@ -157,41 +166,55 @@ if [ "$1" == "load" ]; then
 
  command="curl --user ${api_key} --digest      \
 --include     --silent  \
---request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/clusters?pretty=true\"|grep \"mongoURIWithOptions\"|grep -v \"restoretest\"
+--request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/clusters?pretty=true\"|grep \"mongoURIWithOptions\"
 "
 
  #echo "${command}"
 
- clusters=`eval ${command}`
- if [ "$?" != "0" ]; then
-        STATUS="NOK"
- fi
- 
- clusters=`echo ${clusters}|awk -F"mongodb://" '{print $2}'`
- clusters=`echo ${clusters}|awk -F"/" '{print $1}'`
- echo "Clusters : ${clusters} in ${2} Environment"
+ eval ${command}>${TMPSTBY}
+ #cat ${TMPSTBY}
+ clusters=""
+ while read line; do
+ 	IFS=',' read -ra ADDR <<< "${line}"
+	for cluster in "${ADDR[@]}"; do
+        	#echo ${cluster}
+ 	        cluster1=`echo $cluster|sed 's/"mongoURIWithOptions" : "mongodb:\/\///g'`
+		control=`echo $cluster1|grep -i "ssl"|wc -l`
+		if [ "$control" != "0" ]; then
+			cluster1=`echo $cluster1|awk -F'/' '{print $1}'`
+		fi
+		#echo $cluster1
+        	clusters=${clusters}${cluster1}","
+	done
+ done < ${TMPSTBY}
+
+ echo "Clusters : ${clusters} in ${2} Environment"|tee -a ${LOGFILE} 
 
  echo -n > ${TMPSTBY}
  IFS=',' read -ra ADDR <<< "${clusters}"
  for cluster in "${ADDR[@]}"; do
-  
+  if [ "$cluster" == "" ]; then
+	continue
+  fi
+
+  #echo $cluster 
+
+  new_last_upload_time=`date '+%Y%m%d %H:%M:%S'`  
+
   command="curl   --user  ${api_key}  --digest  -i  --silent  \
  --header \"Accept: application/json\"            \
- --request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/processes/${cluster}/performanceAdvisor/slowQueryLogs?pretty=true\"|egrep -e 'line|namespace'"
+ --request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/processes/${cluster}/performanceAdvisor/slowQueryLogs?since=${last_upload_milliseconds}&pretty=true\"|egrep -e 'line|namespace'"
 
   #echo ${command}
-  eval ${command}>> ${TMPSTBY}
-  if [ "$?" != "0" ]; then
-        STATUS="NOK"
-  fi 
- done 
- sed -i 's/"{/{/g' ${TMPSTBY}
- sed -i 's/}"/}/g' ${TMPSTBY}
- sed -i 's/\\//g'  ${TMPSTBY}
- #echo ${TMPSTBY}
+  eval ${command}> ${TMPSTBY}
 
- document="{ "
- while read line; do
+  sed -i 's/"{/{/g' ${TMPSTBY}
+  sed -i 's/}"/}/g' ${TMPSTBY}
+  sed -i 's/\\//g'  ${TMPSTBY}
+  #echo ${TMPSTBY}
+
+  document="{ "
+  while read line; do
 	document="${document}""${line}"
 	if [ -n "$(echo ${line}|grep namespace)" ]; then 
 		document="${document},\"insertdate\":\"${MONGO_DATE}\"}"
@@ -199,6 +222,8 @@ if [ "$1" == "load" ]; then
 		#echo ${expr_replace}
 		echo "${document}">${SORTFILE}
 		#cat ${SORTFILE}
+
+		#make ARRAY line
 		jq -r --arg newval "${expr_replace}" '.line|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
 		
 		cat ${DOCUMENT_FILE}>${SORTFILE}
@@ -207,6 +232,8 @@ if [ "$1" == "load" ]; then
 		sed -i 's/\\n//g' ${SORTFILE}
 		sed -i 's/\\//g' ${SORTFILE}
 		#cat ${SORTFILE}
+
+		#make ARRAY attr
 		expr_replace=$(echo $document|jq '[.line.attr]')
 		#echo "${expr_replace}"
 		jq -r --arg newval "${expr_replace}" '.line[].attr|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
@@ -217,6 +244,8 @@ if [ "$1" == "load" ]; then
                 sed -i 's/\\n//g' ${SORTFILE}
                 sed -i 's/\\//g' ${SORTFILE}
                 #cat ${SORTFILE}
+
+		#make ARRAY command
 		expr_replace=$(echo $document|jq '[.line.attr.command]')
 		#echo "${expr_replace}"
 		jq --arg newval "${expr_replace}" '.line[].attr[].command|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
@@ -227,6 +256,8 @@ if [ "$1" == "load" ]; then
                 sed -i 's/\\n//g' ${SORTFILE}
                 sed -i 's/\\//g' ${SORTFILE}
                 #cat ${SORTFILE}
+
+		#make ARRAY locks
 		expr_replace=$(echo $document|jq '[.line.attr.locks]')
                 jq --arg newval "${expr_replace}" '.line[].attr[].locks|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
 
@@ -236,18 +267,21 @@ if [ "$1" == "load" ]; then
                 sed -i 's/\\n//g' ${SORTFILE}
                 sed -i 's/\\//g' ${SORTFILE}
                 #cat ${SORTFILE}
+
+
+		#make ARRAY writeConcern
 		expr_replace=$(echo $document|jq '[.line.attr.writeConcern]')
                 jq --arg newval "${expr_replace}" '.line[].attr[].writeConcern|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
 
                 cat ${DOCUMENT_FILE}>${SORTFILE}
 	
-		#sed -i 's/\"/\\\"/g' ${SORTFILE}	
 		#cat ${SORTFILE}
+		namespace_new=${namespace}_`echo ${cluster}|awk -F"-shard" '{print $1}'`
 
-		#echo ${SORTFILE}
-		
+		#echo ${namespace_new}
+
 		cat > ${JSFILE}  << EOF
-use "${namespace}";
+use ${namespace_new};
 
 db.runCommand(
 		   {
@@ -257,7 +291,7 @@ db.runCommand(
 EOF
 		cat ${SORTFILE}>>${JSFILE}
 
-		cat >> ${JSFILE}  << EOF3
+		cat >> ${JSFILE}  << EOF2
 		      ],
 		      ordered: false,
 		      writeConcern: { w: "majority", wtimeout: 5000 }
@@ -265,28 +299,38 @@ EOF
 		);		
 		
 exit;
-EOF3
-
+EOF2
+		command=`cat ${JSFILE}`
 		#cat ${JSFILE}
-		echo "use ${namespace};" > ${JSFILE}
-		echo ${mongo_server}
-		echo ${mongo_user}
-		echo ${password}
-		cat ${JSFILE}
-		command="mongo ${mongo_server} --username ${mongo_user}  --password ${password}"
-		echo "${command}"
-		eval "${command}"
-		#mongo ${mongo_server} --username ${mongo_user}  --password ${password}  #< ${JSFILE} 
-		echo OK	
+		mongo 'mongodb+srv://restoretest-pl-0.8p72b.mongodb.net'  --username ${mongo_user} --password ${password} --quiet > /dev/null << -EOF3
+${command}
+quit();
+-EOF3
+
 		if [ "$?" != "0" ]; then
+		      echo $LINE | tee -a ${LOGFILE}
+		      echo "**FAILED** to insert"| tee -a ${LOGFILE}
+		      echo $LINE | tee -a ${LOGFILE}
+		      echo ${command}|tee -a ${LOGFILE}	      
+		      #echo 3
 		      STATUS="NOK"
 		fi
 
+		printf "."|tee -a ${LOGFILE}
+
 		document="{"
-		exit 0
 	fi
- done < <(egrep -e 'line|namespace' ${TMPSTBY})
+  done < <(egrep -e 'line|namespace' ${TMPSTBY})
+ done
+ #update last_upload_time in Config
+ sed -i "s/${projectname}_LAST_UPLOAD_TIME='${last_upload_time}'/${projectname}_LAST_UPLOAD_TIME='${new_last_upload_time}'/g" ${CONFFILE}
 fi
 
 ################
+
+rm -f ${JSFILE}
+rm -f ${SORTFILE}
+rm -f ${TMPSTBY}
+rm -f ${DOCUMENT_FILE}
+
 end

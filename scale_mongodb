@@ -1,0 +1,170 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------#
+# AUTHOR  : ASA
+# EMAIL   : DBA-APF-Oracle@system.dvag.com
+# ---------------------------------------------------------------------------#
+
+DATUM=$(date +'%Y%m%d_%H%M%S')
+LOGFILE="/tws/log/dba/scale_mongodb_$1_$2_$3_${DATUM}.log"
+CONFFIG="/tws/parms/dba/scale_mongodb.cfg"
+TMPFILE="/tws/log/dba/scale_mongodb_${DATUM}.lst"
+STATUS="OK"
+
+
+# USAGE
+if [[ ("$1" == "ENT" || "$1" == "ABN" || "$1" == "PRD") && ( ! -z "$2") && ("$3" == "$(echo "$3"|egrep 'M[1-6]0')" )  ]]; then
+                printf ""
+else
+                echo "================================================================"
+                echo "============== USAGE ==========================================="
+                echo ""
+                echo "./scale_mongodb  ENT|ABN|PRD  <cluster name> M[1-6]0"
+                echo ""
+                echo "================================================================"
+                exit 0
+fi
+
+
+#Kontrolle ob der Job laeuft..
+for pid in $(/sbin/pidof -x scale_mongodb); do
+    if [ $pid != $$ ]; then
+        echo "[$(date)] : Job scale_mongodb laeuft..! PID $pid"
+        exit 0
+    fi
+done
+
+MASK1="%-100s %-9s\n"
+MASK2="%-80s%-20s %-9s\n"
+MASK3="%-80s%-10s%10s %-9s\n"
+MASK4="%-90s%10s %-9s\n"
+MASK5="%-40s%10s %-9s\n"
+MASK6="%-110s\n"
+
+echo -n > ${LOGFILE}
+
+LINE="--------------------------------------------------------------------------------------------------------"
+echo $LINE | tee -a ${LOGFILE}
+
+function end {
+if [ "${STATUS}" == "OK" ]; then
+        echo ""  | tee -a ${LOGFILE}
+	echo "SCALE MOGNODB CLUSTER **Success**" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE
+        exit 0
+else
+	echo ""  | tee -a ${LOGFILE}
+        echo "SCALE MONGODB CLUSTER **Failed**" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE | tee -a ${LOGFILE}
+        exit 0
+fi
+}
+
+echo | tee -a ${LOGFILE}
+echo "Validating Configuration File..." | tee -a ${LOGFILE}
+if [ ! -s ${CONFFIG} ]; then
+                STATUS="NOK"
+                printf "%-100s %-20s \n" "Configurationfile not found!" "NOK" | tee -a ${LOGFILE}
+                end
+else
+        proxy="$(egrep -iw ^HTTPS_PROXY ${CONFFIG} | awk -F '=' '{print $2}')"
+	api_key="$(egrep -iw ^API_KEY ${CONFFIG} | awk -F '=' '{print $2}')"
+	group_id="$(egrep -iw ^ID_${1} ${CONFFIG} | awk -F '=' '{print $2}')"
+	cluster="$(egrep -iw ^ENABLED:${1}:${2} ${CONFFIG} | awk -F ':' '{print $3}')"
+	to_size="$3"
+
+        declare -a var_names=("proxy" "api_key" "group_id" "cluster")
+        declare -a var_values=("$proxy" "$api_key" "$group_id" "$cluster") 
+        number_vars=${#var_names[@]}
+        x=0
+
+        while [ $x -lt $number_vars ]; do
+                eval param=\${var_values[x]};
+                if [ -z "$param" ]; then
+                        STATUS="NOK"
+                        echo "ERROR: No entry for ${var_names[x]} in the configfile ${CONFFIG}" | tee -a ${LOGFILE}
+                        end
+                else
+			if [[ ${var_names[x]} == "api_key" || ${var_names[x]} == "group_id"  ]]; then
+				echo "INFO: ${var_names[x]} : ********" | tee -a ${LOGFILE}
+			else
+	                        echo "INFO: ${var_names[x]} : ${var_values[x]}" | tee -a ${LOGFILE}
+			fi
+                fi
+                        ((x++))
+        done
+
+	export https_proxy=${proxy}
+        echo "Validation OK" | tee -a ${LOGFILE}
+	
+fi
+
+
+command="curl --user ${api_key} --digest --include --request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/clusters/${cluster}?pretty=true\" >> ${TMPFILE}"
+ eval ${command}
+
+if [[ "$(egrep -iw "^HTTP/1.1 200 OK" ${TMPFILE})" != *"HTTP/1.1 200 OK"* ]];then
+	STATUS="NOK"
+        echo "ERROR: API call failed: $command" | tee -a ${LOGFILE}
+        end
+fi
+
+paused_state="$(egrep -iw "paused" ${TMPFILE} | awk -F ": " '{print $2}')"
+diskTypeName="$(egrep -iw "diskTypeName" ${TMPFILE} | awk -F ": " '{print $2}')"
+instanceSizeName_tmp="$(egrep -iw "instanceSizeName" ${TMPFILE} | awk -F ": " '{print $2}')"
+instanceSizeName=${instanceSizeName_tmp:1:-2}
+
+echo "Before State is saved in ${TMPFILE}" | tee -a ${LOGFILE}
+
+if [[ "$paused_state" == *"true"* ]];then 
+	STATUS="NOK"
+	echo "ERROR: Cant scale because the cluster $1 $2 is paused. Please resume cluster and try again. " | tee -a ${LOGFILE}
+	echo "Resume Command: " | tee -a ${LOGFILE}
+	end
+fi
+
+if [[ "$3" == *${instanceSizeName}* ]];then
+	STATUS="NOK"
+	echo "ERROR: Cluster is already $3. No need to scale. " | tee -a ${LOGFILE}
+        end
+fi
+
+echo $LINE | tee -a ${LOGFILE}
+echo "Scaling MongoDB Cluster $1 $2 $instanceSizeName to $3 ..." | tee -a ${LOGFILE}
+
+data="{ \
+         \"providerSettings\" : { \
+    \"providerName\" : \"AZURE\", \
+    \"autoScaling\" : { \
+      \"compute\" : { \
+        \"maxInstanceSize\" : null, \
+        \"minInstanceSize\" : null \
+      } \
+    }, \
+    \"diskTypeName\" : $diskTypeName \
+    \"instanceSizeName\" : \"$3\", \
+    \"regionName\" : \"EUROPE_WEST\" \
+  } \
+       } \ "
+
+command="curl --user ${api_key} --digest \
+     --header \"Content-Type: application/json\" \
+     --include \
+     --request PATCH \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/clusters/${cluster}\" \
+     --data '${data}' >>${LOGFILE}"
+
+eval ${command} 
+if [[ "$(egrep -iw "^HTTP/1.1 200 OK" ${LOGFILE})" != *"HTTP/1.1 200 OK"* ]];then
+        STATUS="NOK"
+        echo "ERROR: API call failed: $command" | tee -a ${LOGFILE}
+        end
+fi
+
+
+echo "Scaling in progress ..." | tee -a ${LOGFILE}
+echo "It can take up to 30 Minutes to apply changes" | tee -a ${LOGFILE}
+end
+

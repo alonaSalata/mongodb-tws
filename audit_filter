@@ -9,20 +9,22 @@
 DATUM=$(date +'%Y%m%d_%H%M%S')
 LOGFILE="/tws/log/dba/audit_filter_${DATUM}.log"
 TMPSTBY="/tws/log/dba/audit_filter_${DATUM}.lst"
+LIST1="/tws/log/dba/audit_filter_${DATUM}.lst1"
+LIST2="/tws/log/dba/audit_filter_${DATUM}.lst2"
 CONFFILE="/tws/parms/dba/audit_filter.cfg"
 STATUS="OK"
 
 
 # USAGE
-if [[ ("$1" == "get" || "$1" == "set") && ("$2" == "ENT" || "$2" == "ABN" || "$2" == "PRD") ]]; then
+if [[ ("$1" == "check" || "$1" == "get" || "$1" == "set") && ("$2" == "ENT" || "$2" == "ABN" || "$2" == "PRD") ]]; then
                 printf ""
 else
-                echo "======================================="
-                echo "============== USAGE =================="
+                echo "=========================================="
+                echo "============== USAGE ====================="
                 echo ""
-                echo "./audit_filter   get|set    ENT|ABN|PRD"
+                echo "./audit_filter  check|get|set  ENT|ABN|PRD"
                 echo ""
-                echo "======================================="
+                echo "=========================================="
                 exit 0
 fi
 
@@ -60,6 +62,7 @@ else
 	echo ""  | tee -a ${LOGFILE}
         echo "AUDIT_FILTER **Failed**" | tee -a ${LOGFILE}
         # Mailversand mit RC
+ 	cat ${LOGFILE}  | mail -s "Audit Filter **Failed**"  DBA-APF-Oracle@dvag.com,alona.salata@dvag.com	
         echo "Logfile: ${LOGFILE}"
         echo $LINE | tee -a ${LOGFILE}
         exit 0
@@ -76,11 +79,12 @@ else
         proxy="$(egrep -iw ^HTTPS_PROXY ${CONFFILE} | awk -F '=' '{print $2}')"
 	api_key="$(egrep -iw ^API_KEY ${CONFFILE} | awk -F '=' '{print $2}')"
 	group_id="$(egrep -iw ^${2}_GROUP_ID ${CONFFILE} | awk -F '=' '{print $2}')"
+	condition="$(egrep -iw ^${2}_CONDITION ${CONFFILE} | awk -F '=' '{print $2}')"
 	#abn_group_id="$(egrep -iw ^ABN_GROUP_ID ${CONFFILE} | awk -F '=' '{print $2}')"
 	#prd_group_id="$(egrep -iw ^PRD_GROUP_ID ${CONFFILE} | awk -F '=' '{print $2}')"
 
-        declare -a var_names=("proxy" "api_key" "group_id" )
-        declare -a var_values=("$proxy" "$api_key" "$group_id" ) 
+        declare -a var_names=("proxy" "api_key" "group_id" "condition")
+        declare -a var_values=("$proxy" "$api_key" "$group_id" "$condition") 
         number_vars=${#var_names[@]}
         x=0
 
@@ -108,6 +112,82 @@ fi
  echo $LINE | tee -a ${LOGFILE}
  echo "${1}ting audit filter for $2..." | tee -a ${LOGFILE}
 
+if [  "$1" == "check" ]; then
+
+
+ #CLOUD CONTROL USER NAMESPACES
+ command="curl --user ${api_key} \
+--digest \
+--header \"Accept: application/json\"  \
+--silent \
+--request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/auditLog?pretty=true\" "
+
+ #echo "${command}"
+
+ eval ${command}> ${TMPSTBY}
+ sed -i 's/\\n//g' ${TMPSTBY}
+ sed -i 's/\\//g' ${TMPSTBY}
+ sed -i 's/"{/{/g' ${TMPSTBY}
+ sed -i 's/}"/}/g' ${TMPSTBY}
+ #jq . ${TMPSTBY}>> ${LOGFILE}
+ #jq . ${TMPSTBY}
+ jq '.auditFilter."$and"[]."users.user"."$not"."$in"' ${TMPSTBY}|grep -v "null"|grep -v "\["|grep -v "\]"|sed 's/\s//g'> ${LIST1}
+
+
+ command="curl --user ${api_key} --digest      \
+--header \"Accept: application/json\"      \
+--header \"Content-Type: application/json\"  \
+--include     --silent  \
+--request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/databaseUsers?pretty=true\"|grep username|awk -F\": \"  '{print \$2}'
+ "
+ #echo ${command}
+ eval ${command} > ${LIST2}
+ flag="false"
+ while read line1; do
+	while read line2; do
+		LINE1=`echo ${line1}|sed 's/"//g'|sed 's/,//g'`
+		LINE2=`echo ${line2}|sed 's/"//g'|sed 's/,//g'`
+		if [ "$LINE1" == "$LINE2" ]; then
+			flag="true"
+		fi
+	done < ${LIST2}
+	if [ "$flag" == "false" ]; then
+		echo "the User : $LINE1 is not exists on Cluster.!"|tee -a ${LOGFILE}
+		STATUS="NOK"
+	fi
+	flag="false"
+ done < ${LIST1} 
+
+
+ flag="false"
+ while read line2; do
+        while read line1; do
+                LINE1=`echo ${line2}|sed 's/"//g'|sed 's/,//g'`
+                LINE2=`echo ${line1}|sed 's/"//g'|sed 's/,//g'`
+                if [ "$LINE2" == "$LINE1" ]; then
+                        flag="true"
+                fi
+        done < ${LIST1}
+        if [ "$flag" == "false" ]; then
+		command="echo ${LINE1}|egrep ${condition}|wc -l"
+		#echo $command
+		control=`eval ${command}`
+		if [ "$control" != "0" ]; then
+	                echo "the User : $LINE1 is not in Audit_Filter.!"|tee -a ${LOGFILE}
+			STATUS="NOK"
+		fi
+        fi
+        flag="false"
+ done < ${LIST2}
+ 
+ 
+ if [ "$?" != "0" ]; then
+        STATUS="NOK"
+ fi
+
+ end
+fi
+
 if [  "$1" == "get" ]; then
 
 
@@ -120,7 +200,13 @@ if [  "$1" == "get" ]; then
 
  #echo "${command}"
 
- eval ${command} | tee -a ${LOGFILE}
+ eval ${command}> ${TMPSTBY}
+ sed -i 's/\\n//g' ${TMPSTBY}
+ sed -i 's/\\//g' ${TMPSTBY}
+ sed -i 's/"{/{/g' ${TMPSTBY}
+ sed -i 's/}"/}/g' ${TMPSTBY}
+ jq . ${TMPSTBY}>> ${LOGFILE}
+ jq . ${TMPSTBY}
 
  if [ "$?" != "0" ]; then
 	STATUS="NOK"
@@ -137,7 +223,7 @@ if [  "$1" == "set" ]; then
 --header \"Accept: application/json\"      \
 --header \"Content-Type: application/json\"  \     
 --include      \
---request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/databaseUsers?pretty=true\" --silent|egrep -e 'username'|egrep -e 'VAU|KDSCHUL01|reporting|powerBI' |awk -F\"    \\\"username\\\" : \" '{print \"\\t\"\$2}'|tr '\n' ' '"
+--request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/databaseUsers?pretty=true\" --silent|egrep -e 'username'|egrep -e ${condition} |awk -F\"    \\\"username\\\" : \" '{print \"\\t\"\$2}'|tr '\n' ' '"
 
  #echo "${command}"
  data1='"{\n  \"$and\": [\n    {\n      \"roles\": {\n        \"$elemMatch\": {\n          \"role\": {\n            \"$ne\": \"__system\"\n          }\n        }\n      }\n    },\n    {\n      \"users.user\": {\n        \"$not\": {\n          \"$in\": [\n           '
@@ -177,8 +263,15 @@ if [  "$1" == "set" ]; then
 "
 
  #echo "${command}"
+ 
+ eval ${command}> ${TMPSTBY}
+ sed -i 's/\\n//g' ${TMPSTBY}
+ sed -i 's/\\//g' ${TMPSTBY}
+ sed -i 's/"{/{/g' ${TMPSTBY}
+ sed -i 's/}"/}/g' ${TMPSTBY}
+ jq . ${TMPSTBY}>> ${LOGFILE}
+ jq . ${TMPSTBY}
 
- eval ${command}| tee -a ${LOGFILE}
  if [ "$?" != "0" ]; then
         STATUS="NOK"
  fi

@@ -43,6 +43,8 @@ DATUM=$(date +'%Y%m%d_%H%M%S')
 LOGFILE="/tws/log/dba/manage_user_${DATUM}.log"
 TMPSTBY="/tws/log/dba/manage_user_${DATUM}.lst"
 CONFFILE="/tws/parms/dba/manage_user.cfg"
+AUDIT_FILTER="/tws/jobs/dba/audit_filter"
+AUDIT_FILTER_CONFFILE="/tws/parms/dba/audit_filter.cfg"
 STATUS="OK"
 
 
@@ -118,14 +120,16 @@ else
 	projectname=$(printValue "user-$2" Projectname < ${CONFFILE})
 	cluster=$(printValue "user-$2" Cluster < ${CONFFILE})
 	dbnamespaces_rollen=$(printValue "user-$2" DBNamespacesRollen < ${CONFFILE})
+	audit=$(printValue "user-$2" AUDIT < ${CONFFILE})
 	user=${2}
 	password=$(printValue "user-$2" Password < ${CONFFILE})
         proxy="$(egrep -iw ^HTTPS_PROXY ${CONFFILE} | awk -F '=' '{print $2}')"
 	api_key="$(egrep -iw ^API_KEY ${CONFFILE} | awk -F '=' '{print $2}')"
 	group_id="$(egrep -iw ^${projectname}_GROUP_ID ${CONFFILE} | awk -F '=' '{print $2}')"
+	audit_condition="$(egrep -iw ^${projectname}_CONDITION ${AUDIT_FILTER_CONFFILE} | awk -F '=' '{print $2}')"
 
-        declare -a var_names=("proxy" "api_key" "group_id" "projectname" "cluster" "dbnamespace_rollen" "user" "password")
-        declare -a var_values=("$proxy" "$api_key" "$group_id" "$projectname" "$cluster" "$dbnamespaces_rollen" "$user" "$password") 
+        declare -a var_names=("proxy" "api_key" "group_id" "projectname" "cluster" "dbnamespace_rollen" "user" "password" "audit" "audit_condition")
+        declare -a var_values=("$proxy" "$api_key" "$group_id" "$projectname" "$cluster" "$dbnamespaces_rollen" "$user" "$password" "$audit" "$audit_condition") 
         number_vars=${#var_names[@]}
         x=0
 
@@ -198,6 +202,22 @@ if [ "$1" == "create" ]; then
  if [ "$?" != "0" ]; then
         STATUS="NOK"
  fi
+
+ #get audit_filter settings
+  
+ audit_filter=`${AUDIT_FILTER} get ${projectname}|grep   "enabled"|awk -F"  \"enabled\": " '{print $2}'`
+ #echo $audit_filter
+ if [ "$audit_filter"  == "true" ]; then
+	if [ "$audit"  == "true" ]; then
+		control_condition=`echo $user|egrep -e ${audit_condition}|wc -l`
+		if [ "$control_condition" == "0" ]; then
+			sed -i "s/${projectname}_CONDITION=${audit_condition}/${projectname}_CONDITION=${audit_condition::-1}|$user'/g"  ${AUDIT_FILTER_CONFFILE}
+		fi
+	fi
+	${AUDIT_FILTER} set ${projectname}
+	
+ fi
+ 
 fi
 
 if [ "$1" == "delete" ]; then
@@ -218,6 +238,26 @@ if [ "$1" == "delete" ]; then
         STATUS="NOK"
  fi
 
+
+ #get audit_filter settings
+ 
+ audit_filter=`${AUDIT_FILTER} get ${projectname}|grep   "enabled"|awk -F"  \"enabled\": " '{print $2}'`
+ #echo $audit_filter
+ if [ "$audit_filter"  == "true" ]; then
+	if [ "$audit"  == "true" ]; then
+                control_condition=`echo ${audit_condition}|egrep -e ${user}|wc -l`
+		#echo $user
+		#echo ${audit_condition}
+		#echo CONTROL=$control_condition
+                if [ "$control_condition" != "0" ]; then
+			new_audit_condition=`echo ${audit_condition}|sed "s/|${user}//g"`
+			#echo ${new_audit_condition}
+                        sed -i "s/${projectname}_CONDITION=${audit_condition}/${projectname}_CONDITION=${new_audit_condition}/g"  ${AUDIT_FILTER_CONFFILE}
+                fi
+        fi
+
+        ${AUDIT_FILTER} set ${projectname}
+ fi
 fi
 ################
 end
