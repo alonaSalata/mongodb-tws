@@ -25,20 +25,35 @@ else
 fi
 
 
-#Kontrolle ob der Job laeuft..
-for pid in $(/sbin/pidof -x scale_mongodb); do
-    if [ $pid != $$ ]; then
-        echo "[$(date)] : Job scale_mongodb laeuft..! PID $pid"
-        exit 0
-    fi
-done
 
-MASK1="%-100s %-9s\n"
-MASK2="%-80s%-20s %-9s\n"
-MASK3="%-80s%-10s%10s %-9s\n"
-MASK4="%-90s%10s %-9s\n"
-MASK5="%-40s%10s %-9s\n"
-MASK6="%-110s\n"
+# ================================================================================
+# Kontrolle ob der Job laeuft..
+MyScript="$(basename $0)"
+MyPidId=$$
+MyPidFile="/tmp/scale_mongodb.pid"
+# chek other pid
+if [ -s "${MyPidFile}" ]; then
+        OtherPid="$(cat ${MyPidFile})"
+        OtherIsRunning="$(ps -ef|grep -v grep|grep -c ${OtherPid})"
+        if [ "${OtherIsRunning}" = "0" ]; then
+                echo "WARNING: ignoring orphaned pidfile with PID=${OtherPid}"
+        else
+                echo "ERROR: scale_mongodb still running with PID=${OtherPid}"
+                exit 1
+        fi
+fi
+
+echo "${MyPidId}" > ${MyPidFile}
+# check lost race condition
+sleep 1
+CheckPid="$(cat ${MyPidFile})"
+if [ "${MyPidId}" = "${CheckPid}" ]; then
+        echo "INFO: i am the new master of the pidfile"
+else
+        echo "ERROR: lost race condition"
+        echo "ERROR: other scale_mongodb running with PID=${CheckPid}"
+        exit 1
+fi
 
 echo -n > ${LOGFILE}
 
@@ -52,6 +67,7 @@ if [ "${STATUS}" == "OK" ]; then
         # Mailversand mit RC
         echo "Logfile: ${LOGFILE}"
         echo $LINE
+	echo "$hostname ${LOGFILE}" | mail -s "Scaling MongoDB Cluster $env $cluster to $target_size  **Success**" alona.salata@dvag.com
         exit 0
 else
 	echo ""  | tee -a ${LOGFILE}
@@ -59,9 +75,14 @@ else
         # Mailversand mit RC
         echo "Logfile: ${LOGFILE}"
         echo $LINE | tee -a ${LOGFILE}
+	echo "$hostname ${LOGFILE}" | mail -s "Scaling MongoDB Cluster $env $cluster to $target_size  **Failed**" alona.salata@dvag.com
         exit 0
 fi
 }
+
+env=$1
+cluster=$2
+target_size=$3
 
 echo | tee -a ${LOGFILE}
 echo "Validating Configuration File..." | tee -a ${LOGFILE}
@@ -163,8 +184,39 @@ if [[ "$(egrep -iw "^HTTP/1.1 200 OK" ${LOGFILE})" != *"HTTP/1.1 200 OK"* ]];the
         end
 fi
 
+start_time="$(date -u +%s)"
 
 echo "Scaling in progress ..." | tee -a ${LOGFILE}
 echo "It can take up to 30 Minutes to apply changes" | tee -a ${LOGFILE}
+
+command="curl --user ${api_key} --digest --include --request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/clusters/${cluster}?pretty=true\" | grep 'instanceSizeName\|stateName' | awk -F ': ' '{print $2}' > /tmp/status"
+
+flag="NULL"
+
+while [[ "$flag" == "NULL" ]]; do
+        eval ${command} >${LOGFILE} 2>&1
+        sleep 5
+        instanceSizeName="$(grep $to_size /tmp/status)"
+        stateName="$(grep IDLE /tmp/status)"
+        if [[ ("$instanceSizeName" == *"$to_size"* ) && ("$stateName" == *"IDLE"* ) ]]; then
+                flag="READY"
+                end_time="$(date -u +%s)"
+                elapsed="$(($end_time-$start_time))"
+                ((elapsed_mins=$elapsed / 60))
+                echo "Scaling complete after $elapsed_mins minute(s)." | tee -a ${LOGFILE}
+        else
+                end_time="$(date -u +%s)"
+                elapsed="$(($end_time-$start_time))"
+                ((elapsed_mins=$elapsed / 60))
+                echo "Scaling in progress since $elapsed_mins minute(s) ..." | tee -a ${LOGFILE}
+                if [ $elapsed_mins -lt 45 ]; then
+                        sleep 55
+                else
+                        STATUS="NOK"
+                        echo "Scaling timeout reached ($elapsed_mins mins). Exiting Error ..." | tee -a ${LOGFILE}
+                        end
+                fi
+        fi
+done
 end
 

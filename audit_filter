@@ -151,7 +151,7 @@ if [  "$1" == "check" ]; then
 			flag="true"
 		fi
 	done < ${LIST2}
-	if [ "$flag" == "false" ]; then
+	if [[ ("$flag" == "false") && ("$LINE1" != *"mms-"*) ]]; then
 		echo "the User : $LINE1 is not exists on Cluster.!"|tee -a ${LOGFILE}
 		STATUS="NOK"
 	fi

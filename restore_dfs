@@ -53,7 +53,7 @@ if [ "${STATUS}" == "OK" ]; then
         echo "Restore DFS **Success**" | tee -a ${LOGFILE}
         # Mailversand mit RC
 	echo "$hostname ${LOGFILE}" | mail -s "Restore DFS **Success**"  DBA-APF-Oracle@system.dvag.com alona.salata@dvag.com
-#	echo "Daten zur VP-Digital wurden erfolgreich aktualisiert"  | mail -s "Restore VP-Digital **Success**" "julius.sickenberger.extern@dvag.com sarah.berges@dvag.com johannes.gerhard@dvag.com alona.salata@dvag.com"
+	echo "Daten zur VP-Digital wurden erfolgreich aktualisiert"  | mail -s "Restore VP-Digital **Success**" julius.sickenberger.extern@dvag.com sarah.berges@dvag.com johannes.gerhard@dvag.com
         echo "Logfile: ${LOGFILE}"
         echo $LINE
         exit 0
@@ -61,10 +61,10 @@ else
         echo "Failed!" | tee -a ${LOGFILE}
         # Mailversand mit RC
         echo "$hostname ${LOGFILE}" | mail -s "Restore DFS **Failed**"  DBA-APF-Oracle@system.dvag.com alona.salata@dvag.com
-#       echo "Fehler bei der Aktualisierung der Daten zur VP-Digital. DBAs analysieren und beheben die Fehlr zeitnah." | mail -s "Restore DFS **Failed**" "julius.sickenberger.extern@dvag.com;sarah.berges@dvag.com;johannes.gerhard@dvag.com"
+       echo "Fehler bei der Aktualisierung der Daten zur VP-Digital. DBAs analysieren und beheben die Fehlr zeitnah." | mail -s "Restore DFS **Failed**" julius.sickenberger.extern@dvag.coms sarah.berges@dvag.com johannes.gerhard@dvag.com
         echo "Logfile: ${LOGFILE}"
-        echo $LINE | tee -a ${LOGFILE}
-        exit 0
+        echo $LINE 
+        exit 1
 fi
 }
 

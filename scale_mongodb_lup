@@ -1,0 +1,159 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------#
+# AUTHOR  : ASA
+# EMAIL   : DBA-APF-Oracle@system.dvag.com
+# ---------------------------------------------------------------------------#
+
+DATUM=$(date +'%Y%m%d_%H%M%S')
+LOGFILE="/tws/log/dba/scale_mongodb_lup_$1_${DATUM}.log"
+TMPFILE="/tws/log/dba/scale_mongodb_lup_${DATUM}.lst"
+STATUS="OK"
+
+
+#Kontrolle ob der Job laeuft..
+for pid in $(/sbin/pidof -x scale_mongodb); do
+    if [ $pid != $$ ]; then
+        echo "[$(date)] : Job scale_mongodb laeuft..! PID $pid"
+        exit 0
+    fi
+done
+
+MASK1="%-100s %-9s\n"
+MASK2="%-80s%-20s %-9s\n"
+MASK3="%-80s%-10s%10s %-9s\n"
+MASK4="%-90s%10s %-9s\n"
+MASK5="%-40s%10s %-9s\n"
+MASK6="%-110s\n"
+
+echo -n > ${LOGFILE}
+
+LINE="--------------------------------------------------------------------------------------------------------"
+echo $LINE | tee -a ${LOGFILE}
+
+function end {
+if [ "${STATUS}" == "OK" ]; then
+        echo ""  | tee -a ${LOGFILE}
+	echo "SCALE MOGNODB CLUSTER **Success**" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE
+	echo "$hostname ${LOGFILE}" | mail -s "Scaling MongoDB Cluster $env $cluster to $target_size  **Success**" alona.salata@dvag.com
+        exit 0
+else
+	echo ""  | tee -a ${LOGFILE}
+        echo "SCALE MONGODB CLUSTER **Failed**" | tee -a ${LOGFILE}
+        # Mailversand mit RC
+        echo "Logfile: ${LOGFILE}"
+        echo $LINE | tee -a ${LOGFILE}
+	echo "$hostname ${LOGFILE}" | mail -s "Scaling MongoDB Cluster $env $cluster to $target_size  **Failed**" alona.salata@dvag.com
+        exit 1
+fi
+}
+
+        proxy="http://proxy-dev.infra.dvag.net:3128"
+	api_key="'goaykeoq:6597badd-8e39-407e-91ac-b8662fc0a82f'"
+	group_id="5ff85b7364fac61c5382c54a"
+	cluster="RestoreTest"
+	to_size="$1"
+
+	export https_proxy=${proxy}
+	
+
+
+command="curl --user ${api_key} --digest --include --request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/clusters/${cluster}?pretty=true\" >> ${TMPFILE}"
+ eval ${command}
+
+if [[ "$(egrep -iw "^HTTP/1.1 200 OK" ${TMPFILE})" != *"HTTP/1.1 200 OK"* ]];then
+	STATUS="NOK"
+        echo "ERROR: API call failed: $command" | tee -a ${LOGFILE}
+        end
+fi
+
+paused_state="$(egrep -iw "paused" ${TMPFILE} | awk -F ": " '{print $2}')"
+diskTypeName="$(egrep -iw "diskTypeName" ${TMPFILE} | awk -F ": " '{print $2}')"
+instanceSizeName_tmp="$(egrep -iw "instanceSizeName" ${TMPFILE} | awk -F ": " '{print $2}')"
+instanceSizeName=${instanceSizeName_tmp:1:-2}
+
+echo "Before State is saved in ${TMPFILE}" | tee -a ${LOGFILE}
+
+if [[ "$paused_state" == *"true"* ]];then 
+	STATUS="NOK"
+	echo "ERROR: Cant scale because the cluster $1 $2 is paused. Please resume cluster and try again. " | tee -a ${LOGFILE}
+	echo "Resume Command: " | tee -a ${LOGFILE}
+	end
+fi
+
+if [[ "$1" == *${instanceSizeName}* ]];then
+	STATUS="NOK"
+	echo "WARNING: Cluster is already $1. No need to scale. " | tee -a ${LOGFILE}
+        exit 0
+fi
+
+echo $LINE | tee -a ${LOGFILE}
+echo "Scaling MongoDB Cluster $cluster to $1 ..." | tee -a ${LOGFILE}
+
+data="{ \
+         \"providerSettings\" : { \
+    \"providerName\" : \"AZURE\", \
+    \"autoScaling\" : { \
+      \"compute\" : { \
+        \"maxInstanceSize\" : null, \
+        \"minInstanceSize\" : null \
+      } \
+    }, \
+    \"diskTypeName\" : $diskTypeName \
+    \"instanceSizeName\" : \"$to_size\", \
+    \"regionName\" : \"EUROPE_WEST\" \
+  } \
+       } \ "
+
+command="curl --user ${api_key} --digest \
+     --header \"Content-Type: application/json\" \
+     --include \
+     --request PATCH \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/clusters/${cluster}\" \
+     --data '${data}' >>${LOGFILE}"
+
+eval ${command} 
+if [[ "$(egrep -iw "^HTTP/1.1 200 OK" ${LOGFILE})" != *"HTTP/1.1 200 OK"* ]];then
+        STATUS="NOK"
+        echo "ERROR: API call failed: $command" | tee -a ${LOGFILE}
+        end
+fi
+
+
+start_time="$(date -u +%s)"
+echo "Scaling in progress ..." | tee -a ${LOGFILE}
+echo "It can take up to 30 Minutes to apply changes" | tee -a ${LOGFILE}
+
+command="curl --user ${api_key} --digest --include --request GET \"https://cloud.mongodb.com/api/atlas/v1.0/groups/${group_id}/clusters/${cluster}?pretty=true\" | grep 'instanceSizeName\|stateName' | awk -F ': ' '{print $2}' > /tmp/status"
+
+flag="NULL"
+
+while [[ "$flag" == "NULL" ]]; do
+	eval ${command} >${LOGFILE} 2>&1
+	sleep 5
+	instanceSizeName="$(grep $to_size /tmp/status)"
+	stateName="$(grep IDLE /tmp/status)"
+	if [[ ("$instanceSizeName" == *"$to_size"* ) && ("$stateName" == *"IDLE"* ) ]]; then
+		flag="READY"
+                end_time="$(date -u +%s)"
+                elapsed="$(($end_time-$start_time))"
+                ((elapsed_mins=$elapsed / 60))
+                echo "Scaling complete after $elapsed_mins minute(s)." | tee -a ${LOGFILE}
+	else
+		end_time="$(date -u +%s)"
+		elapsed="$(($end_time-$start_time))"
+		((elapsed_mins=$elapsed / 60))
+		echo "Scaling in progress since $elapsed_mins minute(s) ..." | tee -a ${LOGFILE}
+		if [ $elapsed_mins -lt 45 ]; then
+			sleep 55
+		else
+			STATUS="NOK"
+			echo "Scaling timeout reached ($elapsed_mins mins). Exiting Error ..." | tee -a ${LOGFILE}
+			end
+		fi
+	fi
+done 
+
+end
+

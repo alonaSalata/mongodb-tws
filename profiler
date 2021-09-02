@@ -97,7 +97,7 @@ if [ "${STATUS}" == "OK" ]; then
 else
 	echo ""  | tee -a ${LOGFILE}
         echo "Profiler **Failed**" | tee -a ${LOGFILE}
-	cat ${LOGFILE}  | mail -s "Profiler **Failed**"  DBA-APF-Oracle@dvag.com,alona.salata@dvag.com
+	cat ${LOGFILE}  | mail -s "Profiler **Failed**"  alona.salata@dvag.com
         # Mailversand mit RC
         echo "Logfile: ${LOGFILE}"
         echo $LINE | tee -a ${LOGFILE}
@@ -121,7 +121,8 @@ else
 	mongo_server=$(egrep -iw ^MONGO_SERVER ${CONFFILE} | awk -F '=' '{print $2}')
 	mongo_user=$(egrep -iw ^MONGO_USER ${CONFFILE} | awk -F '=' '{print $2}')
 	projectname_lower=${projectname,,}
-	password_file=$(egrep -iw ^PASSWORD_FILE ${CONFFILE} | awk -F '=' '{print $2}'|sed "s/##projectname##/${projectname_lower}/g")
+	#password_file=$(egrep -iw ^PASSWORD_FILE ${CONFFILE} | awk -F '=' '{print $2}'|sed "s/##projectname##/${projectname_lower}/g")
+	password_file=$(egrep -iw ^PASSWORD_FILE ${CONFFILE} | awk -F '=' '{print $2}')
 	#echo $password_file
 	last_upload_time=$(egrep -iw ^${projectname}_LAST_UPLOAD_TIME ${CONFFILE} | awk -F '=' '{print $2}'|sed "s/'//g")
 	namespace=$(date +'%Y%m')
@@ -218,8 +219,8 @@ if [ "$1" == "load" ]; then
 	document="${document}""${line}"
 	if [ -n "$(echo ${line}|grep namespace)" ]; then 
 		document="${document},\"insertdate\":\"${MONGO_DATE}\"}"
-		expr_replace=$(echo $document|jq '[.line]')
-		#echo ${expr_replace}
+		document=`echo "$document"|sed 's/ { loc: "2dsphere" }//g'`
+		expr_replace=$(echo "$document"|jq '[.line]')
 		echo "${document}">${SORTFILE}
 		#cat ${SORTFILE}
 
@@ -234,7 +235,7 @@ if [ "$1" == "load" ]; then
 		#cat ${SORTFILE}
 
 		#make ARRAY attr
-		expr_replace=$(echo $document|jq '[.line.attr]')
+		expr_replace=$(echo "$document"|jq '[.line.attr]')
 		#echo "${expr_replace}"
 		jq -r --arg newval "${expr_replace}" '.line[].attr|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
 
@@ -246,7 +247,7 @@ if [ "$1" == "load" ]; then
                 #cat ${SORTFILE}
 
 		#make ARRAY command
-		expr_replace=$(echo $document|jq '[.line.attr.command]')
+		expr_replace=$(echo "$document"|jq '[.line.attr.command]')
 		#echo "${expr_replace}"
 		jq --arg newval "${expr_replace}" '.line[].attr[].command|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
 
@@ -258,7 +259,7 @@ if [ "$1" == "load" ]; then
                 #cat ${SORTFILE}
 
 		#make ARRAY locks
-		expr_replace=$(echo $document|jq '[.line.attr.locks]')
+		expr_replace=$(echo "$document"|jq '[.line.attr.locks]')
                 jq --arg newval "${expr_replace}" '.line[].attr[].locks|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
 
                 cat ${DOCUMENT_FILE}>${SORTFILE}
@@ -270,7 +271,7 @@ if [ "$1" == "load" ]; then
 
 
 		#make ARRAY writeConcern
-		expr_replace=$(echo $document|jq '[.line.attr.writeConcern]')
+		expr_replace=$(echo "$document"|jq '[.line.attr.writeConcern]')
                 jq --arg newval "${expr_replace}" '.line[].attr[].writeConcern|=$newval' ${SORTFILE} > ${DOCUMENT_FILE}
 
                 cat ${DOCUMENT_FILE}>${SORTFILE}
@@ -302,7 +303,9 @@ exit;
 EOF2
 		command=`cat ${JSFILE}`
 		#cat ${JSFILE}
-		mongo 'mongodb+srv://restoretest-pl-0.8p72b.mongodb.net'  --username ${mongo_user} --password ${password} --quiet > /dev/null << -EOF3
+
+		#echo ${document}
+		mongo 'mongodb+srv://dbamgmt-pl-0.8p72b.mongodb.net'  --username ${mongo_user} --password ${password} --quiet > /dev/null << -EOF3
 ${command}
 quit();
 -EOF3
@@ -314,16 +317,18 @@ quit();
 		      echo ${command}|tee -a ${LOGFILE}	      
 		      #echo 3
 		      STATUS="NOK"
+		      end
 		fi
 
 		printf "."|tee -a ${LOGFILE}
-
 		document="{"
 	fi
   done < <(egrep -e 'line|namespace' ${TMPSTBY})
  done
  #update last_upload_time in Config
- sed -i "s/${projectname}_LAST_UPLOAD_TIME='${last_upload_time}'/${projectname}_LAST_UPLOAD_TIME='${new_last_upload_time}'/g" ${CONFFILE}
+ if [ "$STATUS" != "NOK" ]; then
+	 sed -i "s/${projectname}_LAST_UPLOAD_TIME='${last_upload_time}'/${projectname}_LAST_UPLOAD_TIME='${new_last_upload_time}'/g" ${CONFFILE}
+ fi
 fi
 
 ################
